@@ -347,6 +347,61 @@ class ducklakeSink(SQLSink):
             f"[Memory] After merging temp file: {self._get_memory_usage_mb():.2f} MB"
         )
 
+    def process_batch_files(self, encoding, files) -> None:
+        """Load batch files directly into DuckLake, bypassing Python dict conversion.
+
+        When taps emit BATCH messages with Parquet or JSONL files, this method
+        loads them directly via DuckDB SQL instead of deserializing into Python
+        dicts. This eliminates the biggest memory and CPU bottleneck.
+        """
+        from singer_sdk.helpers._batch import BaseBatchFileEncoding  # noqa: PLC0415
+
+        table_columns = self.connector.get_table_columns(
+            self.target_schema, self.target_table
+        )
+        file_columns = [col["name"] for col in self.ducklake_schema]
+
+        for path in files:
+            # Resolve file:// URLs to local paths
+            if path.startswith("file://"):
+                local_path = path[7:]
+            else:
+                local_path = path
+
+            self.logger.info(f"[BATCH] Loading file directly: {local_path}")
+
+            if (
+                not self.key_properties
+                or self.load_method in ["append", "overwrite"]
+                or self.should_overwrite_table
+            ):
+                self.connector.insert_into_table(
+                    file_location=local_path,
+                    target_schema_name=self.target_schema,
+                    table_name=self.target_table,
+                    file_columns=file_columns,
+                    target_table_columns=table_columns,
+                )
+            elif self.load_method == "merge":
+                date_type_pks = [
+                    col["name"]
+                    for col in self.ducklake_schema
+                    if col["type"] == "DATETIME"
+                ]
+                self.connector.merge_into_table(
+                    file_location=local_path,
+                    target_schema_name=self.target_schema,
+                    table_name=self.target_table,
+                    file_columns=file_columns,
+                    target_table_columns=table_columns,
+                    key_properties=list(self.key_properties),
+                    date_type_keys=list(date_type_pks),
+                )
+
+            self.logger.info(
+                f"[BATCH] Loaded {local_path}, memory: {self._get_memory_usage_mb():.2f} MB"
+            )
+
     def clean_up(self) -> None:
         """Perform per-stream cleanup."""
         super().clean_up()
