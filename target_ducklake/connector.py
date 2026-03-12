@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+import tempfile
 import time
 from typing import Any, Dict, Optional
 
@@ -88,6 +90,7 @@ class DuckLakeConnector(SQLConnector):
         self.region = config.get("region")
 
         self._connection: duckdb.DuckDBPyConnection | None = None
+        self._temp_db_file: str | None = None
         self.catalog_name = "ducklake_catalog"
         self.meta_schema = config.get("meta_schema")
 
@@ -146,8 +149,13 @@ class DuckLakeConnector(SQLConnector):
     def _create_connection(self) -> duckdb.DuckDBPyConnection:
         """Create and configure a new DuckDB connection."""
         try:
-            logger.info("Creating DuckDB connection")
-            conn = duckdb.connect(database=":memory:")
+            # Use a temp file instead of :memory: so DuckDB's buffer manager
+            # can evict pages under memory pressure (duckdb#9033, #20045).
+            # With :memory:, pages are never evicted and RSS grows unboundedly
+            # during large merge operations (DELETE tombstones accumulate).
+            self._temp_db_file = tempfile.mktemp(suffix=".duckdb")
+            logger.info(f"Creating DuckDB connection with temp file: {self._temp_db_file}")
+            conn = duckdb.connect(database=self._temp_db_file)
 
             # Execute startup script to configure DuckLake
             startup_script = self._build_startup_script()
@@ -165,6 +173,7 @@ class DuckLakeConnector(SQLConnector):
             "INSTALL ducklake;",
             "INSTALL postgres;",
             "SET ducklake_max_retry_count=100;",
+            "SET threads=2;",
         ]
 
         if self.catalog_type == "duckdb":
@@ -542,11 +551,19 @@ class DuckLakeConnector(SQLConnector):
         return ducklake_schema
 
     def close(self) -> None:
-        """Close the database connection."""
+        """Close the database connection and clean up temp file."""
         if self._connection is not None:
             logger.info("Closing DuckDB connection")
             self._connection.close()
             self._connection = None
+        if self._temp_db_file and os.path.exists(self._temp_db_file):
+            logger.info(f"Removing temp DuckDB file: {self._temp_db_file}")
+            os.unlink(self._temp_db_file)
+            # Also clean up WAL file if present
+            wal_file = self._temp_db_file + ".wal"
+            if os.path.exists(wal_file):
+                os.unlink(wal_file)
+            self._temp_db_file = None
 
     def __enter__(self) -> DuckLakeConnector:
         """Context manager entry."""
